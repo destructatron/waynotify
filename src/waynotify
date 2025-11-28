@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""
+WayNotify - Wayland Notification Daemon
+Implements the freedesktop.org notification specification with AT-SPI2 accessibility
+"""
+
+import asyncio
+import json
+import os
+import re
+import signal
+import socket
+import sys
+from datetime import datetime
+from html import unescape as html_unescape
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from threading import Lock
+
+from dasbus.connection import SessionMessageBus
+from dasbus.server.interface import dbus_interface, dbus_signal, returns_multiple_arguments
+from dasbus.typing import Variant, UInt32, Int32
+from gi.repository import GLib
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('Atspi', '2.0')
+gi.require_version('Atk', '1.0')
+
+try:
+    gi.require_version('GtkLayerShell', '0.1')
+    from gi.repository import GtkLayerShell
+    LAYER_SHELL_AVAILABLE = True
+except (ValueError, ImportError):
+    LAYER_SHELL_AVAILABLE = False
+    print("Warning: GtkLayerShell not available, on-screen notifications disabled")
+
+from gi.repository import Gtk, Atk
+
+try:
+    from gi.repository import Atspi
+    ATSPI_AVAILABLE = True
+except (ImportError, ValueError):
+    ATSPI_AVAILABLE = False
+    print("Warning: Atspi not available, Orca announcements disabled")
+
+
+def strip_html(text: str) -> str:
+    """
+    Strip HTML tags per freedesktop.org notification specification.
+
+    Only strips the 5 tags allowed by the spec: <b>, <i>, <u>, <a>, <img>
+    Preserves all other angle bracket usage (like <spoiler>, <@user>, etc.)
+
+    Reference: https://specifications.freedesktop.org/notification/latest-single/
+    "A full-blown HTML implementation is not required of this spec, and
+    notifications should never take advantage of tags that are not listed above."
+
+    Examples:
+        "<b>Bold</b> text" -> "Bold text"
+        "<i>Italic</i> text" -> "Italic text"
+        "<a href='url'>Link</a>" -> "Link"
+        "<spoiler>secret</spoiler>" -> "<spoiler>secret</spoiler>" (preserved)
+        "Hey <@user123>" -> "Hey <@user123>" (preserved)
+        "&lt;3" -> "<3" (entity decoded)
+    """
+    if not text:
+        return text
+
+    # Strip only the 5 tags allowed by freedesktop.org spec
+    # Match opening tags with attributes: <tag ...> and closing tags: </tag>
+    text = re.sub(r'</?b(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?i(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?u(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?a(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<img(?:\s[^>]*)?\s*/?>', '', text, flags=re.IGNORECASE)
+
+    # Decode HTML entities (&amp;, &lt;, &quot;, etc.)
+    text = html_unescape(text)
+
+    # Clean up excessive whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+
+def unwrap_variant(value):
+    """
+    Recursively unwrap dasbus Variant objects to native Python values.
+
+    Handles nested structures like lists, tuples, dicts containing Variants.
+    """
+    # If it's a Variant, unwrap it first
+    if hasattr(value, 'get_native'):
+        value = value.get_native()
+
+    # Recursively unwrap nested structures
+    if isinstance(value, dict):
+        return {k: unwrap_variant(v) for k, v in value.items()}
+    elif isinstance(value, (list, tuple)):
+        result = [unwrap_variant(item) for item in value]
+        return tuple(result) if isinstance(value, tuple) else result
+    else:
+        return value
+
+
+def get_hint_value(hints: Dict, key: str, default=None):
+    """
+    Safely get a value from hints dictionary, unwrapping Variant if needed.
+
+    Args:
+        hints: Dictionary that may contain Variant values (from dasbus)
+        key: The key to lookup
+        default: Default value if key not found
+
+    Returns:
+        The unwrapped Python value or default
+    """
+    if key in hints:
+        return unwrap_variant(hints[key])
+    return default
+
+
+def unwrap_hints_dict(hints: Dict) -> Dict:
+    """
+    Unwrap all Variant values in a hints dictionary for JSON serialization.
+
+    Args:
+        hints: Dictionary that may contain Variant values (from dasbus)
+
+    Returns:
+        Dictionary with all Variant values unwrapped to native Python types
+    """
+    return {key: unwrap_variant(value) for key, value in hints.items()}
+
+
+def ensure_json_serializable(obj):
+    """
+    Recursively ensure an object is JSON serializable by converting any non-standard types.
+
+    This is a safety net for any Variant objects or other non-JSON-serializable types
+    that might slip through.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Handle Variant objects
+    if hasattr(obj, 'get_native'):
+        obj = obj.get_native()
+        # Recursively process the unwrapped value
+        return ensure_json_serializable(obj)
+
+    # Handle bytes
+    if isinstance(obj, bytes):
+        return obj.decode('utf-8', errors='replace')
+
+    # Handle dictionaries
+    if isinstance(obj, dict):
+        return {ensure_json_serializable(k): ensure_json_serializable(v)
+                for k, v in obj.items()}
+
+    # Handle lists and tuples
+    if isinstance(obj, (list, tuple)):
+        result = [ensure_json_serializable(item) for item in obj]
+        return tuple(result) if isinstance(obj, tuple) else result
+
+    # Handle datetime objects
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+
+    # Fallback: convert to string
+    return str(obj)
+
+
+class Notification:
+    """Represents a single notification"""
+
+    def __init__(self, notification_id: int, app_name: str, replaces_id: int,
+                 app_icon: str, summary: str, body: str, actions: List[str],
+                 hints: Dict, expire_timeout: int):
+        self.id = notification_id
+        self.app_name = app_name
+        self.replaces_id = replaces_id
+        self.app_icon = app_icon
+        # Store ORIGINAL markup for spec compliance and socket clients
+        # HTML will be stripped only for display to prevent screen readers
+        # from announcing markup tags
+        self.summary = summary
+        self.body = body
+        # Store stripped versions for display/accessibility
+        self.summary_plain = strip_html(summary)
+        self.body_plain = strip_html(body)
+        # Unwrap any Variant objects in actions list
+        self.actions = unwrap_variant(actions)
+        # Unwrap all Variant values in hints for JSON serialization
+        self.hints = unwrap_hints_dict(hints)
+        self.expire_timeout = expire_timeout
+        self.timestamp = datetime.now()
+        self.is_read = False
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for client transmission"""
+        return {
+            'id': self.id,
+            'app_name': self.app_name,
+            'app_icon': self.app_icon,
+            'summary': self.summary,
+            'body': self.body,
+            'actions': self.actions,
+            'timestamp': self.timestamp.isoformat(),
+            'is_read': self.is_read,
+            'urgency': get_hint_value(self.hints, 'urgency', 1)
+        }
+
+    def get_default_action(self) -> Optional[str]:
+        """Get the default action if available"""
+        if self.actions:
+            for i in range(0, len(self.actions), 2):
+                if self.actions[i] == 'default':
+                    return self.actions[i]
+        return None
+
+
+class NotificationPopup(Gtk.Window):
+    """
+    On-screen notification popup using GTK Layer Shell
+    Displays notifications with full AT-SPI2 accessibility support
+    """
+
+    # Class-level list to track all active popups
+    active_popups = []
+    POPUP_WIDTH = 350
+    POPUP_SPACING = 10
+
+    def __init__(self, notification: 'Notification', on_close_callback=None):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.notification = notification
+        self.on_close_callback = on_close_callback
+        self.timeout_id = None
+
+        # Configure window
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_default_size(self.POPUP_WIDTH, -1)
+
+        # Initialize GTK Layer Shell if available
+        if LAYER_SHELL_AVAILABLE:
+            GtkLayerShell.init_for_window(self)
+            GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_namespace(self, "waynotify")
+
+            # Anchor to top-right corner
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+
+            # Set margins
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, self._calculate_y_position())
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 10)
+
+        # Build UI
+        self._build_ui()
+
+        # Set accessibility properties
+        self._set_accessible_properties()
+
+        # Set up timeout
+        if notification.expire_timeout > 0:
+            self.timeout_id = GLib.timeout_add(notification.expire_timeout, self._on_timeout)
+        elif notification.expire_timeout == -1:
+            # Default timeout: 5 seconds
+            self.timeout_id = GLib.timeout_add(5000, self._on_timeout)
+
+        # Track this popup
+        NotificationPopup.active_popups.append(self)
+
+        # Connect destroy signal
+        self.connect('destroy', self._on_destroy)
+
+    def _calculate_y_position(self):
+        """Calculate Y position based on other popups"""
+        y_offset = 10
+        for popup in NotificationPopup.active_popups:
+            if popup != self and popup.get_visible():
+                # Add height of existing popup plus spacing
+                allocation = popup.get_allocation()
+                y_offset += allocation.height + self.POPUP_SPACING
+        return y_offset
+
+    def _create_icon(self) -> Optional[Gtk.Image]:
+        """
+        Create icon from various sources: file paths, URIs, icon names, or image data.
+
+        Supports:
+        - Icon theme names (e.g., "dialog-information")
+        - File paths (e.g., "/usr/share/pixmaps/icon.png")
+        - file:// URIs (e.g., "file:///path/to/icon.png")
+        - Image data from hints (image-data or icon_data)
+
+        Returns:
+            Gtk.Image or None if icon cannot be loaded
+        """
+        from gi.repository import GdkPixbuf
+        import os
+
+        icon_size = 48  # Size for DIALOG icons
+
+        # Try to load icon from image-data or icon_data hint first (highest priority)
+        image_data = get_hint_value(self.notification.hints, 'image-data') or \
+                     get_hint_value(self.notification.hints, 'image_data') or \
+                     get_hint_value(self.notification.hints, 'icon_data')
+
+        if image_data:
+            try:
+                # image-data format: (width, height, rowstride, has_alpha, bits_per_sample, channels, data)
+                if isinstance(image_data, (tuple, list)) and len(image_data) >= 7:
+                    width, height, rowstride, has_alpha, bits_per_sample, channels, data = image_data[:7]
+
+                    # Convert data to bytes if needed
+                    if isinstance(data, list):
+                        data = bytes(data)
+
+                    # Create pixbuf from image data
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_data(
+                        data,
+                        GdkPixbuf.Colorspace.RGB,
+                        bool(has_alpha),
+                        int(bits_per_sample),
+                        int(width),
+                        int(height),
+                        int(rowstride)
+                    )
+
+                    # Scale to icon size while preserving aspect ratio
+                    if pixbuf:
+                        pixbuf = pixbuf.scale_simple(
+                            icon_size,
+                            icon_size,
+                            GdkPixbuf.InterpType.BILINEAR
+                        )
+                        return Gtk.Image.new_from_pixbuf(pixbuf)
+            except Exception as e:
+                print(f"Error loading image data from hints: {e}")
+
+        # Try to load icon from app_icon parameter
+        if not self.notification.app_icon:
+            return None
+
+        app_icon = self.notification.app_icon.strip()
+
+        # Handle file:// URIs
+        if app_icon.startswith('file://'):
+            app_icon = app_icon[7:]  # Remove 'file://' prefix
+
+        # Check if it's a file path (absolute or relative)
+        if app_icon.startswith('/') or os.path.exists(app_icon):
+            try:
+                # Load from file
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                    app_icon,
+                    icon_size,
+                    icon_size
+                )
+                return Gtk.Image.new_from_pixbuf(pixbuf)
+            except Exception as e:
+                print(f"Error loading icon from file '{app_icon}': {e}")
+                # Fall through to try as icon name
+
+        # Try as icon theme name
+        try:
+            # Check if icon exists in theme
+            icon_theme = Gtk.IconTheme.get_default()
+            if icon_theme.has_icon(app_icon):
+                return Gtk.Image.new_from_icon_name(
+                    app_icon,
+                    Gtk.IconSize.DIALOG
+                )
+        except Exception as e:
+            print(f"Error loading icon from theme '{app_icon}': {e}")
+
+        return None
+
+    def _build_ui(self):
+        """Build the notification UI"""
+        # Main container with styling
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main_box.get_style_context().add_class('notification-popup')
+
+        # Get urgency for styling
+        urgency = get_hint_value(self.notification.hints, 'urgency', 1)
+        if urgency == 2:  # Critical
+            main_box.get_style_context().add_class('notification-critical')
+        elif urgency == 0:  # Low
+            main_box.get_style_context().add_class('notification-low')
+
+        # Content box with padding
+        content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        content_box.set_margin_start(16)
+        content_box.set_margin_end(16)
+        content_box.set_margin_top(12)
+        content_box.set_margin_bottom(12)
+
+        # Icon - support multiple icon types
+        icon = self._create_icon()
+        if icon:
+            icon.set_valign(Gtk.Align.START)
+            content_box.pack_start(icon, False, False, 0)
+
+        # Text content
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        text_box.set_hexpand(True)
+
+        # App name
+        app_label = Gtk.Label(label=self.notification.app_name)
+        app_label.set_halign(Gtk.Align.START)
+        app_label.set_line_wrap(False)
+        app_label.get_style_context().add_class('notification-app-name')
+        text_box.pack_start(app_label, False, False, 0)
+
+        # Summary - use plain text version for accessibility (no HTML markup for Orca)
+        summary_label = Gtk.Label(label=self.notification.summary_plain)
+        summary_label.set_halign(Gtk.Align.START)
+        summary_label.set_line_wrap(True)
+        summary_label.set_max_width_chars(40)
+        summary_label.set_xalign(0)
+        summary_label.get_style_context().add_class('notification-summary')
+        text_box.pack_start(summary_label, False, False, 0)
+
+        # Body - use plain text version for accessibility (no HTML markup for Orca)
+        if self.notification.body_plain:
+            body_label = Gtk.Label(label=self.notification.body_plain)
+            body_label.set_halign(Gtk.Align.START)
+            body_label.set_line_wrap(True)
+            body_label.set_max_width_chars(40)
+            body_label.set_xalign(0)
+            body_label.set_lines(3)
+            body_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+            body_label.get_style_context().add_class('notification-body')
+            text_box.pack_start(body_label, False, False, 0)
+
+        content_box.pack_start(text_box, True, True, 0)
+
+        # Close button
+        close_button = Gtk.Button()
+        close_icon = Gtk.Image.new_from_icon_name('window-close-symbolic', Gtk.IconSize.BUTTON)
+        close_button.set_image(close_icon)
+        close_button.set_relief(Gtk.ReliefStyle.NONE)
+        close_button.set_valign(Gtk.Align.START)
+        close_button.connect('clicked', self._on_close_clicked)
+        close_button.set_tooltip_text("Dismiss notification")
+        content_box.pack_end(close_button, False, False, 0)
+
+        main_box.pack_start(content_box, True, True, 0)
+
+        # Actions
+        if self.notification.actions:
+            actions_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            actions_box.set_margin_start(16)
+            actions_box.set_margin_end(16)
+            actions_box.set_margin_bottom(12)
+
+            for i in range(0, len(self.notification.actions), 2):
+                if i + 1 < len(self.notification.actions):
+                    action_key = self.notification.actions[i]
+                    action_label = self.notification.actions[i + 1]
+
+                    button = Gtk.Button(label=action_label)
+                    button.connect('clicked', self._on_action_clicked, action_key)
+                    button.get_style_context().add_class('notification-action')
+                    actions_box.pack_start(button, False, False, 0)
+
+            main_box.pack_start(actions_box, False, False, 0)
+
+        self.add(main_box)
+
+        # Apply CSS
+        self._apply_css()
+
+    def _apply_css(self):
+        """Apply CSS styling"""
+        css_provider = Gtk.CssProvider()
+        css = """
+        .notification-popup {
+            background-color: @theme_base_color;
+            border: 1px solid @borders;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+        }
+        .notification-critical {
+            background-color: #fdf0ef;
+            border-color: #e01b24;
+        }
+        .notification-low {
+            opacity: 0.9;
+        }
+        .notification-app-name {
+            font-weight: bold;
+            font-size: 9pt;
+            opacity: 0.7;
+        }
+        .notification-summary {
+            font-weight: bold;
+            font-size: 11pt;
+        }
+        .notification-body {
+            font-size: 10pt;
+            opacity: 0.9;
+        }
+        .notification-action {
+            font-size: 9pt;
+        }
+        """
+        css_provider.load_from_data(css.encode())
+
+        screen = self.get_screen()
+        style_context = Gtk.StyleContext()
+        style_context.add_provider_for_screen(
+            screen,
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def _set_accessible_properties(self):
+        """Set accessibility properties for screen readers"""
+        accessible = self.get_accessible()
+        if not accessible:
+            return
+
+        # Set role to notification - this tells Orca it's a notification
+        accessible.set_role(Atk.Role.NOTIFICATION)
+
+        # IMPORTANT: Don't set accessible_name or accessible_description here.
+        # Setting them causes Orca to read both the window's accessible properties
+        # AND the actual text content of the labels inside, resulting in double announcements.
+        #
+        # Instead, we rely on GTK's natural accessibility tree where Orca reads
+        # the visible text from the GTK labels. This is the standard approach
+        # used by GTK applications and prevents double reading.
+        #
+        # The Atk.Role.NOTIFICATION tells Orca this is a notification, and it will
+        # automatically announce the text content of the visible widgets.
+
+        # Set urgency hint for critical notifications (helps window managers)
+        urgency = get_hint_value(self.notification.hints, 'urgency', 1)
+        self.set_urgency_hint(urgency == 2)  # Urgent for critical notifications
+
+    def _on_close_clicked(self, button):
+        """Handle close button click"""
+        self._close()
+
+    def _on_action_clicked(self, button, action_key):
+        """Handle action button click"""
+        if self.on_close_callback:
+            self.on_close_callback(self.notification.id, action_key)
+        self._close()
+
+    def _on_timeout(self):
+        """Handle expiration timeout"""
+        self._close()
+        return False  # Don't repeat
+
+    def _close(self):
+        """Close the popup"""
+        if self.timeout_id:
+            GLib.source_remove(self.timeout_id)
+            self.timeout_id = None
+        self.destroy()
+
+    def _on_destroy(self, widget):
+        """Handle window destruction"""
+        # Remove from active popups
+        if self in NotificationPopup.active_popups:
+            NotificationPopup.active_popups.remove(self)
+
+        # Reposition remaining popups
+        if LAYER_SHELL_AVAILABLE:
+            for popup in NotificationPopup.active_popups:
+                popup._reposition()
+
+    def _reposition(self):
+        """Reposition this popup based on other popups"""
+        if LAYER_SHELL_AVAILABLE:
+            new_y = self._calculate_y_position()
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, new_y)
+
+
+@dbus_interface("org.freedesktop.Notifications")
+class NotificationDaemon:
+    """
+    D-Bus service implementing org.freedesktop.Notifications
+
+    Uses dasbus for native asyncio integration, eliminating the need for
+    ThreadPoolExecutor and run_coroutine_threadsafe patterns.
+    """
+
+    DBUS_NAME = 'org.freedesktop.Notifications'
+    DBUS_PATH = '/org/freedesktop/Notifications'
+    DBUS_INTERFACE = 'org.freedesktop.Notifications'
+
+    def __init__(self, loop=None):
+        self.notifications: Dict[int, Notification] = {}
+        self.next_id = 1
+        self.lock = Lock()
+        self.clients = []
+        self.loop = loop  # Store asyncio loop for scheduling tasks
+        self.dnd_enabled = False  # Do Not Disturb mode
+
+        print(f"Notification daemon started on D-Bus: {self.DBUS_NAME}")
+
+    @returns_multiple_arguments
+    def GetServerInformation(self) -> Tuple[str, str, str, str]:
+        """Get server information - returns 4 strings as separate out parameters"""
+        return 'WayNotify', 'waynotify', '0.1', '1.2'
+
+    def GetCapabilities(self) -> List[str]:
+        """Get server capabilities"""
+        return [
+            'actions',
+            'body',
+            'body-markup',
+            'icon-static',
+            'persistence',
+            'sound'
+        ]
+
+    def Notify(self, app_name: str, replaces_id: UInt32, app_icon: str,
+               summary: str, body: str, actions: List[str], hints: Dict[str, Variant],
+               expire_timeout: Int32) -> UInt32:
+        """
+        Send a notification
+
+        Args:
+            app_name: Name of the application
+            replaces_id: ID of notification to replace (0 for new)
+            app_icon: Icon name or path
+            summary: Summary text
+            body: Body text
+            actions: List of action identifiers and labels
+            hints: Additional hints
+            expire_timeout: Timeout in milliseconds (-1 for default, 0 for never)
+
+        Returns:
+            Notification ID
+        """
+        with self.lock:
+            if replaces_id > 0 and replaces_id in self.notifications:
+                notification_id = replaces_id
+            else:
+                notification_id = self.next_id
+                self.next_id += 1
+
+            notification = Notification(
+                notification_id, app_name, replaces_id, app_icon,
+                summary, body, actions, hints, expire_timeout
+            )
+
+            self.notifications[notification_id] = notification
+
+            # Announce to Orca via AT-SPI2
+            self._announce_to_orca(notification)
+
+            # Notify connected clients - dasbus integrates naturally with asyncio
+            if self.loop:
+                asyncio.ensure_future(self._notify_clients(notification), loop=self.loop)
+
+            # Handle expiration
+            if expire_timeout > 0:
+                GLib.timeout_add(expire_timeout, self._expire_notification, notification_id)
+            elif expire_timeout == -1:
+                # Default timeout: 5 seconds (matches popup timeout)
+                GLib.timeout_add(5000, self._expire_notification, notification_id)
+
+            print(f"[{app_name}] {summary}: {body}")
+
+        return notification_id
+
+    def _close_notification_internal(self, notification_id: int, reason: int):
+        """Internal method to close notification without emitting D-Bus signals"""
+        with self.lock:
+            if notification_id in self.notifications:
+                del self.notifications[notification_id]
+                if self.loop:
+                    asyncio.ensure_future(self._notify_clients_closed(notification_id), loop=self.loop)
+        return reason
+
+    def CloseNotification(self, notification_id: UInt32):
+        """Close a notification (D-Bus method)"""
+        reason = self._close_notification_internal(notification_id, 3)
+        if reason:
+            # With dasbus, signal emission is non-blocking - no executor needed
+            self.NotificationClosed(notification_id, reason)
+
+    @dbus_signal
+    def NotificationClosed(self, notification_id: UInt32, reason: UInt32):
+        """
+        Signal emitted when notification is closed
+        Reason: 1=expired, 2=dismissed by user, 3=closed by call, 4=undefined
+        """
+        pass
+
+    @dbus_signal
+    def ActionInvoked(self, notification_id: UInt32, action_key: str):
+        """Signal emitted when notification action is invoked"""
+        pass
+
+    def _expire_notification(self, notification_id: int) -> bool:
+        """
+        Handle popup expiration timeout.
+
+        NOTE: We do NOT emit NotificationClosed here because the notification is kept
+        in history for later action invocation from the client. If we emit NotificationClosed,
+        applications like Discord will clean up their state and stop listening for
+        ActionInvoked signals, breaking the "click action in waynotify-client" workflow.
+
+        NotificationClosed will be emitted when:
+        - An action is invoked (reason 2 = Dismissed by user)
+        - The notification is explicitly closed via CloseNotification (reason 3)
+        """
+        # Popup expired, but notification remains in history
+        # Do not emit NotificationClosed - keep notification available for client actions
+        return False  # Don't repeat
+
+    def _announce_to_orca(self, notification: Notification):
+        """Show notification popup with AT-SPI2 accessibility for Orca"""
+        try:
+            # Skip showing popup if Do Not Disturb mode is enabled
+            # Notification is still saved in history and accessible via client
+            if self.dnd_enabled:
+                print(f"DND mode: suppressing popup for notification {notification.id}")
+                return
+
+            # Create and show notification popup
+            # The popup window has full AT-SPI2 accessibility attributes
+            # which will trigger Orca to announce it when it appears on screen
+            if LAYER_SHELL_AVAILABLE:
+                popup = NotificationPopup(notification, self._on_popup_action)
+                popup.show_all()
+            elif not hasattr(self, '_layer_shell_warning_shown'):
+                print("Warning: GTK Layer Shell not available, notifications will not be displayed on screen")
+                self._layer_shell_warning_shown = True
+
+            # Play system notification sound if specified
+            sound = get_hint_value(notification.hints, 'sound-name')
+            if sound:
+                os.system(f'paplay /usr/share/sounds/freedesktop/stereo/{sound}.oga 2>/dev/null &')
+
+        except Exception as e:
+            print(f"Error displaying notification: {e}")
+
+    def _on_popup_action(self, notification_id: int, action_key: str):
+        """Handle action invoked from popup"""
+        # Schedule via GLib.idle_add to decouple from GTK button callback
+        GLib.idle_add(self._emit_action_signal, notification_id, action_key)
+
+    def _emit_action_signal(self, notification_id: int, action_key: str):
+        """Handle action invocation and emit D-Bus signals"""
+        # First, check if notification exists and action is valid
+        with self.lock:
+            if notification_id not in self.notifications:
+                return False
+            notification = self.notifications[notification_id]
+            if action_key not in notification.actions:
+                return False
+
+        # Close notification internally (without D-Bus signals)
+        reason = self._close_notification_internal(notification_id, 2)  # 2 = Dismissed by user
+
+        # Emit D-Bus signals - dasbus handles non-blocking signal emission
+        if reason:
+            self.ActionInvoked(notification_id, action_key)
+            self.NotificationClosed(notification_id, reason)
+
+        return False  # Don't repeat
+
+    async def _notify_clients(self, notification: Notification):
+        """Notify all connected clients of new notification"""
+        message = {
+            'type': 'new_notification',
+            'notification': notification.to_dict()
+        }
+        await self._broadcast_to_clients(message)
+
+    async def _notify_clients_closed(self, notification_id: int):
+        """Notify all connected clients that notification was closed"""
+        message = {
+            'type': 'notification_closed',
+            'id': notification_id
+        }
+        await self._broadcast_to_clients(message)
+
+    async def _broadcast_to_clients(self, message: Dict):
+        """Broadcast message to all connected clients"""
+        # Ensure all data is JSON serializable (safety net for Variant objects)
+        clean_message = ensure_json_serializable(message)
+        message_str = json.dumps(clean_message) + '\n'
+        for client in self.clients[:]:  # Copy list to avoid modification during iteration
+            try:
+                client['writer'].write(message_str.encode())
+                await client['writer'].drain()
+            except Exception as e:
+                print(f"Error sending to client, removing: {e}")
+                if client in self.clients:
+                    self.clients.remove(client)
+
+    def get_all_notifications(self) -> List[Dict]:
+        """Get all current notifications"""
+        with self.lock:
+            return [n.to_dict() for n in sorted(
+                self.notifications.values(),
+                key=lambda x: x.timestamp,
+                reverse=True
+            )]
+
+    def invoke_action(self, notification_id: int, action_key: str) -> bool:
+        """Invoke an action on a notification"""
+        with self.lock:
+            if notification_id in self.notifications:
+                notification = self.notifications[notification_id]
+                if action_key in notification.actions:
+                    # Schedule via GLib.idle_add (called from socket handler asyncio context)
+                    GLib.idle_add(self._emit_action_signal, notification_id, action_key)
+                    return True
+        return False
+
+    def mark_as_read(self, notification_id: int) -> bool:
+        """Mark notification as read"""
+        with self.lock:
+            if notification_id in self.notifications:
+                self.notifications[notification_id].is_read = True
+                return True
+        return False
+
+    def get_dnd_state(self) -> bool:
+        """Get Do Not Disturb state"""
+        return self.dnd_enabled
+
+    def set_dnd_state(self, enabled: bool):
+        """Set Do Not Disturb state and broadcast to clients"""
+        with self.lock:
+            self.dnd_enabled = enabled
+            print(f"DND mode {'enabled' if enabled else 'disabled'}")
+
+        # Broadcast state change to all clients
+        if self.loop:
+            asyncio.ensure_future(self._broadcast_dnd_state(enabled), loop=self.loop)
+
+    async def _broadcast_dnd_state(self, enabled: bool):
+        """Broadcast DND state change to all connected clients"""
+        message = {
+            'type': 'dnd_state_changed',
+            'enabled': enabled
+        }
+        await self._broadcast_to_clients(message)
+
+
+class NotificationServer:
+    """Local socket server for client connections"""
+
+    def __init__(self, daemon: NotificationDaemon, socket_path: str):
+        self.daemon = daemon
+        self.socket_path = socket_path
+        self.server = None
+
+    async def start(self):
+        """Start the local socket server"""
+        # Remove existing socket file
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+
+        # Create directory if needed
+        os.makedirs(os.path.dirname(self.socket_path), exist_ok=True)
+
+        self.server = await asyncio.start_unix_server(
+            self.handle_client,
+            path=self.socket_path
+        )
+
+        # Set permissions
+        os.chmod(self.socket_path, 0o600)
+
+        print(f"Client server listening on {self.socket_path}")
+
+        async with self.server:
+            await self.server.serve_forever()
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle a client connection"""
+        client = {'reader': reader, 'writer': writer}
+        self.daemon.clients.append(client)
+
+        try:
+            addr = writer.get_extra_info('socket').getpeername()
+            print(f"Client connected: {addr}")
+        except:
+            addr = "unknown"
+            print(f"Client connected")
+
+        try:
+            while True:
+                data = await reader.readline()
+                if not data:
+                    break
+
+                try:
+                    message = json.loads(data.decode().strip())
+                    response = await self.handle_message(message)
+
+                    # Ensure response is JSON serializable (safety net for Variant objects)
+                    clean_response = ensure_json_serializable(response)
+                    response_str = json.dumps(clean_response) + '\n'
+                    writer.write(response_str.encode())
+                    await writer.drain()
+
+                except json.JSONDecodeError:
+                    error_response = {'error': 'Invalid JSON'}
+                    writer.write((json.dumps(error_response) + '\n').encode())
+                    await writer.drain()
+                except ConnectionError:
+                    # Connection was reset, break out of loop
+                    break
+
+        except ConnectionError as e:
+            # Connection reset by peer, this is normal when client closes
+            print(f"Client disconnected (connection reset)")
+        except Exception as e:
+            print(f"Client error: {e}")
+        finally:
+            # Remove client from list first
+            if client in self.daemon.clients:
+                self.daemon.clients.remove(client)
+
+            # Close writer gracefully
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                # Ignore errors during close - connection may already be closed
+                pass
+
+            print("Client connection closed")
+
+    async def handle_message(self, message: Dict) -> Dict:
+        """Handle a message from client"""
+        msg_type = message.get('type')
+        request_id = message.get('_request_id')
+
+        # Prepare response with request ID
+        response = {}
+        if request_id is not None:
+            response['_request_id'] = request_id
+
+        if msg_type == 'get_all':
+            response.update({
+                'type': 'notification_list',
+                'notifications': self.daemon.get_all_notifications()
+            })
+
+        elif msg_type == 'invoke_action':
+            notification_id = message.get('id')
+            action_key = message.get('action', 'default')
+            success = self.daemon.invoke_action(notification_id, action_key)
+            response.update({'type': 'action_result', 'success': success})
+
+        elif msg_type == 'close':
+            notification_id = message.get('id')
+            self.daemon.CloseNotification(notification_id)
+            response.update({'type': 'close_result', 'success': True})
+
+        elif msg_type == 'mark_read':
+            notification_id = message.get('id')
+            success = self.daemon.mark_as_read(notification_id)
+            response.update({'type': 'mark_read_result', 'success': success})
+
+        elif msg_type == 'get_dnd_state':
+            enabled = self.daemon.get_dnd_state()
+            response.update({'type': 'dnd_state', 'enabled': enabled})
+
+        elif msg_type == 'set_dnd_state':
+            enabled = message.get('enabled', False)
+            self.daemon.set_dnd_state(enabled)
+            response.update({'type': 'dnd_state_result', 'success': True, 'enabled': enabled})
+
+        else:
+            response.update({'error': 'Unknown message type'})
+
+        return response
+
+
+def setup_error_logging():
+    """
+    Set up logging to capture both stdout (info) and stderr (errors).
+
+    This is critical for debugging issues when the daemon is started by the
+    compositor or D-Bus activation, where stdout/stderr are not visible in a terminal.
+    """
+    # Determine log directory
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
+    log_dir = os.path.join(runtime_dir, 'waynotify')
+
+    # Create log directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Set up log file paths
+    info_log_path = os.path.join(log_dir, 'waynotify.log')
+    error_log_path = os.path.join(log_dir, 'error.log')
+
+    try:
+        # Open log files in append mode with line buffering
+        # This ensures each line is written immediately (helpful for crashes)
+        info_log = open(info_log_path, 'a', buffering=1)
+        error_log = open(error_log_path, 'a', buffering=1)
+
+        # Write a separator with timestamp for new daemon start
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        info_log.write(f"\n{'=' * 60}\n")
+        info_log.write(f"WayNotify daemon started at {timestamp}\n")
+        info_log.write(f"{'=' * 60}\n\n")
+        info_log.flush()
+
+        error_log.write(f"\n{'=' * 60}\n")
+        error_log.write(f"WayNotify daemon started at {timestamp}\n")
+        error_log.write(f"{'=' * 60}\n\n")
+        error_log.flush()
+
+        # Redirect stdout and stderr to their respective log files
+        sys.stdout = info_log
+        sys.stderr = error_log
+
+    except Exception as e:
+        # If we can't set up logging, print to stderr (original) and continue
+        print(f"Warning: Could not set up logging: {e}", file=sys.stderr)
+
+
+def main():
+    """Main entry point"""
+    # Set up error logging first, before anything else can fail
+    setup_error_logging()
+
+    # Create asyncio event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Connect to session bus and publish D-Bus service
+    bus = SessionMessageBus()
+
+    # Create notification daemon with loop reference
+    daemon = NotificationDaemon(loop)
+
+    # Publish the D-Bus service
+    bus.publish_object(daemon.DBUS_PATH, daemon)
+    bus.register_service(daemon.DBUS_NAME)
+
+    # Set up socket path
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
+    socket_path = os.path.join(runtime_dir, 'waynotify', 'socket')
+
+    # Create local server
+    server = NotificationServer(daemon, socket_path)
+
+    # Start asyncio server in the background
+    def start_server():
+        """Start the asyncio server"""
+        asyncio.ensure_future(server.start(), loop=loop)
+        return False  # Don't repeat
+
+    GLib.idle_add(start_server)
+
+    # Process asyncio events in GLib main loop
+    def process_asyncio_events():
+        """Process pending asyncio events"""
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+        return True  # Keep calling this
+
+    # Schedule asyncio processing every 10ms
+    GLib.timeout_add(10, process_asyncio_events)
+
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        """Handle shutdown signals"""
+        print("\nShutting down...")
+
+        # Close all active notification popups
+        for popup in NotificationPopup.active_popups[:]:
+            popup.destroy()
+
+        # Close asyncio server
+        if server.server:
+            server.server.close()
+            # Schedule close completion in asyncio loop
+            async def wait_closed():
+                await server.server.wait_closed()
+            asyncio.ensure_future(wait_closed(), loop=loop)
+
+        # Clean up asyncio tasks
+        try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+        except Exception as e:
+            print(f"Error cancelling tasks: {e}")
+
+        # Quit GTK
+        GLib.timeout_add(100, Gtk.main_quit)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Start GTK main loop (this runs GLib main loop too)
+    # GTK must run in the main thread
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Clean up
+        try:
+            loop.close()
+        except Exception as e:
+            print(f"Error closing loop: {e}")
+
+
+if __name__ == '__main__':
+    main()

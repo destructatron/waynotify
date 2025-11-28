@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""
+WayNotify Client - Accessible GTK notification viewer
+Lists notifications with full screen reader support via AT-SPI2
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from html import unescape as html_unescape
+from typing import Dict, List, Optional
+
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('Atk', '1.0')
+
+from gi.repository import Gtk, GLib, GObject, Atk, Pango
+
+
+def strip_html(text: str) -> str:
+    """
+    Strip HTML tags per freedesktop.org notification specification.
+
+    Only strips the 5 tags allowed by the spec: <b>, <i>, <u>, <a>, <img>
+    Preserves all other angle bracket usage (like <spoiler>, <@user>, etc.)
+
+    Reference: https://specifications.freedesktop.org/notification/latest-single/
+    "A full-blown HTML implementation is not required of this spec, and
+    notifications should never take advantage of tags that are not listed above."
+
+    Examples:
+        "<b>Bold</b> text" -> "Bold text"
+        "<i>Italic</i> text" -> "Italic text"
+        "<a href='url'>Link</a>" -> "Link"
+        "<spoiler>secret</spoiler>" -> "<spoiler>secret</spoiler>" (preserved)
+        "Hey <@user123>" -> "Hey <@user123>" (preserved)
+        "&lt;3" -> "<3" (entity decoded)
+    """
+    if not text:
+        return text
+
+    # Strip only the 5 tags allowed by freedesktop.org spec
+    # Match opening tags with attributes: <tag ...> and closing tags: </tag>
+    text = re.sub(r'</?b(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?i(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?u(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?a(?:\s[^>]*)?\s*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<img(?:\s[^>]*)?\s*/?>', '', text, flags=re.IGNORECASE)
+
+    # Decode HTML entities (&amp;, &lt;, &quot;, etc.)
+    text = html_unescape(text)
+
+    # Clean up excessive whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+
+class NotificationRow(Gtk.ListBoxRow):
+    """A single notification row in the list"""
+
+    def __init__(self, notification: Dict):
+        super().__init__()
+        self.notification = notification
+
+        # Make row accessible
+        self.set_can_focus(True)
+        self.set_activatable(True)
+
+        # Create main container
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+
+        # Header: app name, time, urgency, read status
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+
+        # App name with icon
+        if notification.get('app_icon'):
+            icon = Gtk.Image.new_from_icon_name(notification['app_icon'], Gtk.IconSize.LARGE_TOOLBAR)
+            header_box.pack_start(icon, False, False, 0)
+
+        app_label = Gtk.Label(label=notification['app_name'])
+        app_label.set_halign(Gtk.Align.START)
+        app_label.get_style_context().add_class('app-name')
+        header_box.pack_start(app_label, False, False, 0)
+
+        # Status badges
+        if not notification.get('is_read', False):
+            new_badge = Gtk.Label(label='NEW')
+            new_badge.get_style_context().add_class('badge')
+            new_badge.get_style_context().add_class('new-badge')
+            header_box.pack_start(new_badge, False, False, 0)
+
+        urgency = notification.get('urgency', 1)
+        if urgency == 2:  # Critical
+            urgent_badge = Gtk.Label(label='URGENT')
+            urgent_badge.get_style_context().add_class('badge')
+            urgent_badge.get_style_context().add_class('urgent-badge')
+            header_box.pack_start(urgent_badge, False, False, 0)
+        elif urgency == 0:  # Low
+            low_badge = Gtk.Label(label='LOW')
+            low_badge.get_style_context().add_class('badge')
+            low_badge.get_style_context().add_class('low-badge')
+            header_box.pack_start(low_badge, False, False, 0)
+
+        # Time
+        try:
+            timestamp = datetime.fromisoformat(notification['timestamp'])
+            time_str = timestamp.strftime('%H:%M:%S')
+            time_label = Gtk.Label(label=time_str)
+            time_label.get_style_context().add_class('time-label')
+            time_label.set_halign(Gtk.Align.END)
+            header_box.pack_end(time_label, False, False, 0)
+        except:
+            pass
+
+        box.pack_start(header_box, False, False, 0)
+
+        # Summary
+        summary_label = Gtk.Label(label=strip_html(notification['summary']))
+        summary_label.set_halign(Gtk.Align.START)
+        summary_label.set_line_wrap(True)
+        summary_label.set_max_width_chars(60)
+        summary_label.set_selectable(True)
+        summary_label.get_style_context().add_class('summary')
+        box.pack_start(summary_label, False, False, 0)
+
+        # Body
+        if notification.get('body'):
+            body_label = Gtk.Label(label=strip_html(notification['body']))
+            body_label.set_halign(Gtk.Align.START)
+            body_label.set_line_wrap(True)
+            body_label.set_max_width_chars(60)
+            body_label.set_selectable(True)
+            body_label.get_style_context().add_class('body')
+            box.pack_start(body_label, False, False, 0)
+
+        # Actions
+        actions = notification.get('actions', [])
+        if actions:
+            action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            action_box.set_margin_top(6)
+
+            for i in range(0, len(actions), 2):
+                if i + 1 < len(actions):
+                    action_key = actions[i]
+                    action_label = actions[i + 1]
+
+                    button = Gtk.Button(label=action_label)
+                    button.set_can_focus(True)
+                    button.connect('clicked', self._on_action_clicked, action_key)
+                    action_box.pack_start(button, False, False, 0)
+
+            box.pack_start(action_box, False, False, 0)
+
+        self.add(box)
+
+        # Set accessible properties
+        self._set_accessible_properties()
+
+    def _set_accessible_properties(self):
+        """Set accessibility properties for screen readers"""
+        accessible = self.get_accessible()
+        if not accessible:
+            return
+
+        # Use LIST_ITEM role (not NOTIFICATION) so Orca only announces when navigating,
+        # not automatically when the window opens. The daemon handles auto-announcements.
+        accessible.set_role(Atk.Role.LIST_ITEM)
+
+        # Don't set accessible_name or accessible_description - let Orca naturally
+        # read the GTK widget tree (labels, badges, etc.) to avoid double announcements
+
+    def _on_action_clicked(self, button, action_key):
+        """Handle action button click"""
+        # Emit a custom signal that the parent window will handle
+        self.emit('action-invoked', action_key)
+
+    def get_notification_id(self):
+        """Get the notification ID"""
+        return self.notification['id']
+
+
+# Register signal for NotificationRow
+GObject.signal_new('action-invoked', NotificationRow, GObject.SignalFlags.RUN_FIRST,
+                   GObject.TYPE_NONE, (str,))
+
+
+class NotificationClient:
+    """Client for connecting to WayNotify daemon"""
+
+    def __init__(self, socket_path: str):
+        self.socket_path = socket_path
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.connected = False
+        self.update_callback = None
+        self._pending_responses = {}
+        self._next_request_id = 0
+        self._reader_task = None
+
+    async def connect(self):
+        """Connect to the daemon"""
+        try:
+            self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
+            self.connected = True
+            print("Connected to WayNotify daemon")
+            return True
+        except Exception as e:
+            print(f"Error connecting to daemon: {e}")
+            return False
+
+    def start_listener(self, callback):
+        """Start the message listener task"""
+        self.update_callback = callback
+        if not self._reader_task:
+            # Use ensure_future instead of create_task (works without running loop)
+            self._reader_task = asyncio.ensure_future(self._message_reader())
+
+    async def _message_reader(self):
+        """Read all incoming messages and dispatch them"""
+        while self.connected:
+            try:
+                data = await self.reader.readline()
+                if not data:
+                    break
+
+                message = json.loads(data.decode().strip())
+                msg_type = message.get('type')
+
+                # Check if this is a response to a pending request
+                request_id = message.get('_request_id')
+                if request_id is not None and request_id in self._pending_responses:
+                    # This is a response to a request
+                    future = self._pending_responses.pop(request_id)
+                    future.set_result(message)
+                elif msg_type in ('new_notification', 'notification_closed', 'dnd_state_changed'):
+                    # This is a push notification from daemon
+                    if self.update_callback:
+                        GLib.idle_add(self.update_callback, message)
+
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                if self.connected:
+                    print(f"Error in message reader: {e}")
+                break
+
+    async def send_message(self, message: Dict) -> Dict:
+        """Send a message and wait for response"""
+        if not self.writer:
+            raise Exception("Not connected")
+
+        # Add request ID for response matching
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        message['_request_id'] = request_id
+
+        # Create future for response
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._pending_responses[request_id] = future
+
+        # Send message
+        message_str = json.dumps(message) + '\n'
+        self.writer.write(message_str.encode())
+        await self.writer.drain()
+
+        # Wait for response with timeout
+        try:
+            response = await asyncio.wait_for(future, timeout=5.0)
+            return response
+        except asyncio.TimeoutError:
+            self._pending_responses.pop(request_id, None)
+            raise Exception("Request timeout")
+
+    async def get_notifications(self) -> List[Dict]:
+        """Get all notifications from daemon"""
+        response = await self.send_message({'type': 'get_all'})
+        if response.get('type') == 'notification_list':
+            return response.get('notifications', [])
+        return []
+
+    async def invoke_action(self, notification_id: int, action: str = 'default'):
+        """Invoke an action on a notification"""
+        response = await self.send_message({
+            'type': 'invoke_action',
+            'id': notification_id,
+            'action': action
+        })
+        return response.get('success', False)
+
+    async def close_notification(self, notification_id: int):
+        """Close a notification"""
+        response = await self.send_message({
+            'type': 'close',
+            'id': notification_id
+        })
+        return response.get('success', False)
+
+    async def mark_as_read(self, notification_id: int):
+        """Mark notification as read"""
+        response = await self.send_message({
+            'type': 'mark_read',
+            'id': notification_id
+        })
+        return response.get('success', False)
+
+    async def get_dnd_state(self) -> bool:
+        """Get Do Not Disturb state from daemon"""
+        response = await self.send_message({'type': 'get_dnd_state'})
+        return response.get('enabled', False)
+
+    async def set_dnd_state(self, enabled: bool):
+        """Set Do Not Disturb state"""
+        response = await self.send_message({
+            'type': 'set_dnd_state',
+            'enabled': enabled
+        })
+        return response.get('success', False)
+
+    def disconnect(self):
+        """Disconnect from daemon"""
+        self.connected = False
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self.writer:
+            try:
+                self.writer.close()
+            except Exception:
+                # Ignore errors on disconnect
+                pass
+
+
+class NotificationWindow(Gtk.ApplicationWindow):
+    """Main window for notification viewer"""
+
+    def __init__(self, app, client: NotificationClient):
+        super().__init__(application=app, title="WayNotify - Notifications")
+        self.client = client
+        self.notifications: List[Dict] = []
+
+        # Set window properties
+        self.set_default_size(600, 500)
+        self.set_border_width(0)
+
+        # Set up accessibility
+        accessible = self.get_accessible()
+        if accessible:
+            accessible.set_name("WayNotify Notification Viewer")
+            accessible.set_description("List of system notifications")
+
+        # Create main container
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Header bar
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("WayNotify")
+        header.set_subtitle("Notification Viewer")
+
+        # Refresh button
+        refresh_button = Gtk.Button()
+        refresh_icon = Gtk.Image.new_from_icon_name('view-refresh', Gtk.IconSize.BUTTON)
+        refresh_button.set_image(refresh_icon)
+        refresh_button.set_tooltip_text("Refresh notifications (F5)")
+        refresh_button.connect('clicked', self._on_refresh_clicked)
+        header.pack_start(refresh_button)
+
+        # DND toggle button
+        self.dnd_toggle = Gtk.ToggleButton(label="DND")
+        self.dnd_toggle.set_tooltip_text("Do Not Disturb - suppress notification popups")
+        self.dnd_toggle.connect('toggled', self._on_dnd_toggled)
+        header.pack_end(self.dnd_toggle)
+
+        # Clear all button
+        clear_button = Gtk.Button(label="Clear All")
+        clear_button.set_tooltip_text("Dismiss all notifications")
+        clear_button.connect('clicked', self._on_clear_all_clicked)
+        header.pack_end(clear_button)
+
+        self.set_titlebar(header)
+
+        # Scrolled window for notifications
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+
+        # ListBox for notifications
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(False)
+        self.listbox.connect('row-activated', self._on_row_activated)
+        self.listbox.connect('row-selected', self._on_row_selected)
+
+        # Set accessible properties for listbox
+        listbox_accessible = self.listbox.get_accessible()
+        if listbox_accessible:
+            listbox_accessible.set_name("Notification List")
+            listbox_accessible.set_role(Atk.Role.LIST)
+
+        scrolled.add(self.listbox)
+        main_box.pack_start(scrolled, True, True, 0)
+
+        # Status bar
+        statusbar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        statusbar_box.set_margin_start(12)
+        statusbar_box.set_margin_end(12)
+        statusbar_box.set_margin_top(6)
+        statusbar_box.set_margin_bottom(6)
+
+        self.status_label = Gtk.Label(label="Loading...")
+        self.status_label.set_halign(Gtk.Align.START)
+        statusbar_box.pack_start(self.status_label, True, True, 0)
+
+        help_label = Gtk.Label(label="Enter: Activate | Delete: Dismiss | F5: Refresh | Esc: Close")
+        help_label.get_style_context().add_class('dim-label')
+        help_label.set_halign(Gtk.Align.END)
+        statusbar_box.pack_end(help_label, False, False, 0)
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        main_box.pack_start(separator, False, False, 0)
+        main_box.pack_start(statusbar_box, False, False, 0)
+
+        self.add(main_box)
+
+        # Apply CSS
+        self._apply_css()
+
+        # Set up keyboard shortcuts
+        self.connect('key-press-event', self._on_key_press)
+
+        # Get the event loop
+        self.loop = asyncio.get_event_loop()
+
+        # Start async tasks (delayed to give window time to show)
+        GLib.idle_add(self._start_async_tasks)
+
+    def _apply_css(self):
+        """Apply custom CSS styling"""
+        css_provider = Gtk.CssProvider()
+        css = """
+        .app-name {
+            font-weight: bold;
+            font-size: 11pt;
+        }
+        .summary {
+            font-size: 10pt;
+            font-weight: 500;
+        }
+        .body {
+            font-size: 9pt;
+            color: @theme_fg_color;
+            opacity: 0.8;
+        }
+        .time-label {
+            font-size: 8pt;
+            opacity: 0.6;
+        }
+        .badge {
+            font-size: 7pt;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .new-badge {
+            background-color: #3584e4;
+            color: white;
+        }
+        .urgent-badge {
+            background-color: #e01b24;
+            color: white;
+        }
+        .low-badge {
+            background-color: #9a9996;
+            color: white;
+        }
+        list row:selected {
+            background-color: alpha(@theme_selected_bg_color, 0.3);
+        }
+        """
+        css_provider.load_from_data(css.encode())
+
+        screen = self.get_screen()
+        style_context = Gtk.StyleContext()
+        style_context.add_provider_for_screen(
+            screen,
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def _start_async_tasks(self):
+        """Start async tasks after window is ready"""
+        asyncio.ensure_future(self._initial_load())
+        self.client.start_listener(self._on_notification_update)
+        return False  # Don't repeat
+
+    async def _initial_load(self):
+        """Load initial notifications and DND state"""
+        # Query current DND state from daemon
+        try:
+            dnd_enabled = await self.client.get_dnd_state()
+            GLib.idle_add(self._update_dnd_toggle, dnd_enabled)
+        except Exception as e:
+            print(f"Error getting DND state: {e}")
+
+        await self.refresh_notifications()
+
+    def _on_notification_update(self, message: Dict):
+        """Handle notification update from daemon"""
+        msg_type = message.get('type')
+
+        if msg_type == 'dnd_state_changed':
+            # Update DND toggle button state
+            enabled = message.get('enabled', False)
+            self._update_dnd_toggle(enabled)
+        else:
+            # Note: Notifications are announced by the daemon's on-screen popups.
+            # The client is only for viewing notification history, so we don't
+            # announce them here to avoid duplicate announcements with Orca.
+
+            # Refresh the list to show updated notifications
+            asyncio.ensure_future(self.refresh_notifications())
+
+        return False
+
+    async def refresh_notifications(self):
+        """Refresh notification list"""
+        try:
+            self.notifications = await self.client.get_notifications()
+
+            # Update UI in main thread
+            GLib.idle_add(self._update_notification_list)
+
+        except Exception as e:
+            print(f"Error refreshing notifications: {e}")
+            GLib.idle_add(self._show_error, str(e))
+
+    def _update_notification_list(self):
+        """Update the notification list (must be called from main thread)"""
+        # Clear existing rows
+        for row in self.listbox.get_children():
+            self.listbox.remove(row)
+
+        # Add new rows
+        for notification in self.notifications:
+            row = NotificationRow(notification)
+            row.connect('action-invoked', self._on_action_invoked)
+            row.show_all()
+            self.listbox.add(row)
+
+        # Focus on the first notification for better keyboard navigation
+        if self.notifications:
+            first_row = self.listbox.get_row_at_index(0)
+            if first_row:
+                self.listbox.select_row(first_row)
+                first_row.grab_focus()
+
+        # Update status
+        count = len(self.notifications)
+        unread_count = sum(1 for n in self.notifications if not n.get('is_read'))
+
+        if count == 0:
+            self.status_label.set_text("No notifications")
+        else:
+            status = f"{count} notification{'s' if count != 1 else ''}"
+            if unread_count > 0:
+                status += f" ({unread_count} unread)"
+            self.status_label.set_text(status)
+
+        return False
+
+    def _show_error(self, error: str):
+        """Show error message"""
+        self.status_label.set_text(f"Error: {error}")
+        return False
+
+    def _on_row_activated(self, listbox, row):
+        """Handle row activation (Enter key or double-click)"""
+        if row:
+            notification_id = row.get_notification_id()
+            asyncio.ensure_future(self._activate_notification(notification_id))
+
+    def _on_row_selected(self, listbox, row):
+        """Handle row selection"""
+        if row:
+            # Mark as read when selected
+            notification_id = row.get_notification_id()
+            asyncio.ensure_future(self.client.mark_as_read(notification_id))
+
+    def _on_action_invoked(self, row, action_key):
+        """Handle action button click"""
+        notification_id = row.get_notification_id()
+        asyncio.ensure_future(self.client.invoke_action(notification_id, action_key))
+
+    async def _activate_notification(self, notification_id: int):
+        """Activate default action on notification"""
+        try:
+            await self.client.invoke_action(notification_id, 'default')
+        except Exception as e:
+            print(f"Error activating notification: {e}")
+
+    def _on_refresh_clicked(self, button):
+        """Handle refresh button click"""
+        asyncio.ensure_future(self.refresh_notifications())
+
+    def _on_clear_all_clicked(self, button):
+        """Handle clear all button click"""
+        # Close all notifications
+        for notification in self.notifications:
+            asyncio.ensure_future(self.client.close_notification(notification['id']))
+
+    def _on_dnd_toggled(self, toggle_button):
+        """Handle DND toggle button"""
+        enabled = toggle_button.get_active()
+        asyncio.ensure_future(self._set_dnd_state(enabled))
+
+    async def _set_dnd_state(self, enabled: bool):
+        """Set DND state on daemon"""
+        try:
+            await self.client.set_dnd_state(enabled)
+        except Exception as e:
+            print(f"Error setting DND state: {e}")
+
+    def _update_dnd_toggle(self, enabled: bool):
+        """Update DND toggle button state (must be called from main thread)"""
+        # Block the signal handler to prevent recursive calls
+        self.dnd_toggle.handler_block_by_func(self._on_dnd_toggled)
+        self.dnd_toggle.set_active(enabled)
+        self.dnd_toggle.handler_unblock_by_func(self._on_dnd_toggled)
+        return False
+
+    def _on_key_press(self, widget, event):
+        """Handle keyboard shortcuts"""
+        keyval = event.keyval
+        keyname = event.string
+
+        # Escape: Close window
+        if keyval == 65307:  # Escape
+            self.destroy()
+            return True
+
+        # F5: Refresh
+        elif keyval == 65474:  # F5
+            asyncio.ensure_future(self.refresh_notifications())
+            return True
+
+        # Delete: Dismiss selected
+        elif keyval == 65535:  # Delete
+            row = self.listbox.get_selected_row()
+            if row:
+                notification_id = row.get_notification_id()
+                asyncio.ensure_future(self.client.close_notification(notification_id))
+            return True
+
+        return False
+
+
+class WayNotifyApp(Gtk.Application):
+    """Main application"""
+
+    def __init__(self):
+        super().__init__(application_id='com.github.waynotify')
+        self.window = None
+        self.client = None
+
+    def do_activate(self):
+        """Activate the application"""
+        if not self.window:
+            # Get socket path
+            runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
+            socket_path = os.path.join(runtime_dir, 'waynotify', 'socket')
+
+            # Create client
+            self.client = NotificationClient(socket_path)
+
+            # Create a placeholder window immediately so GTK doesn't exit
+            self.window = self._create_connecting_window()
+            self.window.show_all()
+
+            # Schedule connection after main loop starts
+            GLib.idle_add(self._do_connect_and_setup)
+
+        elif self.window:
+            self.window.present()
+
+    def _create_connecting_window(self):
+        """Create a temporary 'connecting' window"""
+        window = Gtk.ApplicationWindow(application=self, title="WayNotify")
+        window.set_default_size(400, 200)
+        window.set_border_width(20)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+
+        spinner = Gtk.Spinner()
+        spinner.start()
+        box.pack_start(spinner, False, False, 0)
+
+        label = Gtk.Label(label="Connecting to WayNotify daemon...")
+        box.pack_start(label, False, False, 0)
+
+        window.add(box)
+        return window
+
+    def _do_connect_and_setup(self):
+        """Connect to daemon and setup window"""
+        async def connect_and_setup():
+            if not await self.client.connect():
+                # Connection failed - show error
+                GLib.idle_add(self._show_connection_error)
+                return
+
+            # Connected - replace window with real one
+            old_window = self.window
+            self.window = NotificationWindow(self, self.client)
+            self.window.connect('destroy', self._on_window_destroy)
+            self.window.show_all()
+
+            # Close old connecting window
+            if old_window:
+                old_window.destroy()
+
+        asyncio.ensure_future(connect_and_setup())
+        return False  # Don't repeat
+
+    def _show_connection_error(self):
+        """Show connection error dialog"""
+        dialog = Gtk.MessageDialog(
+            transient_for=None,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="Cannot Connect to WayNotify Daemon",
+        )
+        dialog.format_secondary_text(
+            "Make sure the waynotify daemon is running."
+        )
+        dialog.run()
+        dialog.destroy()
+        self.quit()
+        return False
+
+    def _on_window_destroy(self, widget):
+        """Handle window destruction"""
+        if self.client:
+            self.client.disconnect()
+        self.quit()
+
+
+def main():
+    """Main entry point"""
+    # Create event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Keep track of timeout source ID
+    timeout_source_id = [None]
+
+    # Process asyncio events in GLib main loop
+    def process_asyncio_events():
+        """Process pending asyncio events"""
+        # Run any ready callbacks
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+        return True  # Keep calling this
+
+    # Schedule asyncio processing every 10ms
+    timeout_source_id[0] = GLib.timeout_add(10, process_asyncio_events)
+
+    # Create and run app
+    app = WayNotifyApp()
+
+    try:
+        exit_code = app.run(sys.argv)
+    finally:
+        # Stop processing asyncio events
+        if timeout_source_id[0] is not None:
+            GLib.source_remove(timeout_source_id[0])
+
+        # Clean up asyncio tasks
+        try:
+            # Get all tasks
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                # Cancel them
+                for task in pending:
+                    task.cancel()
+
+                # Give them a chance to finish cancellation
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+
+        # Close the loop
+        try:
+            loop.close()
+        except Exception as e:
+            print(f"Error closing loop: {e}")
+
+    return exit_code
+
+
+if __name__ == '__main__':
+    sys.exit(main())

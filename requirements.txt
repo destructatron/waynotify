@@ -1,0 +1,2 @@
+dasbus>=1.6
+PyGObject>=3.42.0
