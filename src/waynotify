@@ -10,6 +10,8 @@ import os
 import re
 import signal
 import socket
+import struct
+import subprocess
 import sys
 from datetime import datetime
 from html import unescape as html_unescape
@@ -352,16 +354,42 @@ class NotificationPopup(Gtk.Window):
         if app_icon.startswith('file://'):
             app_icon = app_icon[7:]  # Remove 'file://' prefix
 
-        # Check if it's a file path (absolute or relative)
-        if app_icon.startswith('/') or os.path.exists(app_icon):
+        # Check if it's a file path (absolute only - reject relative paths for security)
+        if app_icon.startswith('/'):
             try:
-                # Load from file
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
-                    app_icon,
-                    icon_size,
-                    icon_size
+                # Security: Resolve path and validate it's within allowed directories
+                # to prevent path traversal attacks (e.g., "/../../../etc/passwd")
+                icon_path = Path(app_icon).resolve()
+
+                # Whitelist of allowed directories for icon loading
+                allowed_dirs = [
+                    Path('/usr/share/pixmaps'),
+                    Path('/usr/share/icons'),
+                    Path('/usr/local/share/pixmaps'),
+                    Path('/usr/local/share/icons'),
+                    Path(os.path.expanduser('~/.local/share/icons')),
+                    Path(os.path.expanduser('~/.icons')),
+                    # Also allow app-specific icon directories
+                    Path('/opt'),
+                    Path('/var/lib'),
+                ]
+
+                # Check if path is within any allowed directory
+                path_allowed = any(
+                    icon_path == allowed or allowed in icon_path.parents
+                    for allowed in allowed_dirs
                 )
-                return Gtk.Image.new_from_pixbuf(pixbuf)
+
+                if path_allowed and icon_path.is_file():
+                    # Load from file
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        str(icon_path),
+                        icon_size,
+                        icon_size
+                    )
+                    return Gtk.Image.new_from_pixbuf(pixbuf)
+                elif not path_allowed:
+                    print(f"Icon path outside allowed directories, rejected: {icon_path}")
             except Exception as e:
                 print(f"Error loading icon from file '{app_icon}': {e}")
                 # Fall through to try as icon name
@@ -742,7 +770,18 @@ class NotificationDaemon:
             # Play system notification sound if specified
             sound = get_hint_value(notification.hints, 'sound-name')
             if sound:
-                os.system(f'paplay /usr/share/sounds/freedesktop/stereo/{sound}.oga 2>/dev/null &')
+                # Security: Validate sound name to prevent command injection
+                # Only allow alphanumeric characters, hyphens, and underscores
+                if re.match(r'^[a-zA-Z0-9_-]+$', str(sound)):
+                    sound_path = f'/usr/share/sounds/freedesktop/stereo/{sound}.oga'
+                    if os.path.isfile(sound_path):
+                        subprocess.Popen(
+                            ['paplay', sound_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                else:
+                    print(f"Invalid sound name rejected: {sound}")
 
         except Exception as e:
             print(f"Error displaying notification: {e}")
@@ -885,15 +924,36 @@ class NotificationServer:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a client connection"""
+        # Security: Verify client credentials before allowing connection
+        # Only allow connections from processes running as the same user
+        try:
+            client_socket = writer.get_extra_info('socket')
+            if client_socket:
+                # Get peer credentials using SO_PEERCRED (Linux-specific)
+                # Returns (pid, uid, gid) as a struct of 3 integers
+                SO_PEERCRED = 17  # Linux-specific socket option
+                creds = client_socket.getsockopt(
+                    socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize('3i')
+                )
+                pid, uid, gid = struct.unpack('3i', creds)
+
+                # Only allow connections from same user
+                if uid != os.getuid():
+                    print(f"Rejected connection from UID {uid} (we are UID {os.getuid()})")
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+                print(f"Client connected: pid={pid}, uid={uid}")
+            else:
+                print(f"Client connected (could not verify credentials)")
+        except Exception as e:
+            # If we can't verify credentials (e.g., non-Linux), log warning but allow
+            print(f"Warning: Could not verify peer credentials: {e}")
+            print(f"Client connected (credentials not verified)")
+
         client = {'reader': reader, 'writer': writer}
         self.daemon.clients.append(client)
-
-        try:
-            addr = writer.get_extra_info('socket').getpeername()
-            print(f"Client connected: {addr}")
-        except:
-            addr = "unknown"
-            print(f"Client connected")
 
         try:
             while True:

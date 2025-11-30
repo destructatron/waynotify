@@ -351,12 +351,6 @@ class NotificationWindow(Gtk.ApplicationWindow):
         self.set_default_size(600, 500)
         self.set_border_width(0)
 
-        # Set up accessibility
-        accessible = self.get_accessible()
-        if accessible:
-            accessible.set_name("WayNotify Notification Viewer")
-            accessible.set_description("List of system notifications")
-
         # Create main container
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
