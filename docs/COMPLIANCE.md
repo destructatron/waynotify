@@ -18,7 +18,7 @@ WayNotify implements the [freedesktop.org Desktop Notifications Specification ve
 **Returns:**
 - `name`: "WayNotify"
 - `vendor`: "waynotify"
-- `version`: "0.1"
+- `version`: "0.2"
 - `spec_version`: "1.2"
 
 ### ✓ GetCapabilities

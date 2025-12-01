@@ -194,7 +194,7 @@ class NotificationDaemon:
 
     # Methods use type hints instead of signature strings
     def GetServerInformation(self) -> Tuple[str, str, str, str]:
-        return ('WayNotify', 'waynotify', '0.1', '1.2')
+        return ('WayNotify', 'waynotify', '0.2', '1.2')
 
     @dbus_signal
     def NotificationClosed(self, notification_id: int, reason: int):
